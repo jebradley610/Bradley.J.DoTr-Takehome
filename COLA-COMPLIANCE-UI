@@ -1,0 +1,159 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+import os
+
+# --- UI CONFIGURATION & STYLING ---
+st.set_page_config(page_title="TTB COLA Review", layout="wide")
+
+WATCH_FOLDER = "./Pending_Scans"
+os.makedirs(WATCH_FOLDER, exist_ok=True)
+DB_FILE = "ttb_cola_records.db"
+
+# Custom CSS for "Grandmother-proof" accessibility
+st.markdown("""
+    <style>
+    .big-font { font-size: 26px !important; font-weight: bold; color: #333333; }
+    .status-text { font-size: 22px !important; }
+    div[data-testid="stMetricValue"] { font-size: 52px !important; font-weight: 900; }
+    div[data-testid="stMetricLabel"] { font-size: 20px !important; font-weight: bold; }
+    
+    /* Massive, unmistakable Federal Blue action button */
+    .stButton>button { 
+        height: 70px; 
+        font-size: 24px !important; 
+        font-weight: bold;
+        border-radius: 12px;
+        background-color: #005A9C; 
+        color: white;
+        border: 3px solid #003366;
+        box-shadow: 2px 4px 10px rgba(0,0,0,0.2);
+    }
+    .stButton>button:hover {
+        background-color: #00407A;
+        color: white;
+        border-color: #002244;
+    }
+    
+    .streamlit-expanderHeader {
+        font-size: 22px !important;
+        font-weight: bold;
+        background-color: #F0F2F6;
+        border-radius: 8px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+def load_data():
+    """Fetches queue data from the offline SQLite database."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("SELECT * FROM label_queue ORDER BY timestamp DESC", conn)
+        conn.close()
+        return df
+    except sqlite3.OperationalError:
+        return pd.DataFrame(columns=['id', 'business_reg_number', 'status', 'verdict', 'discrepancies', 'timestamp'])
+
+# --- MAIN DASHBOARD ---
+st.markdown("<h1>⚖️ TTB COLA Label Verification System</h1>", unsafe_allow_html=True)
+st.markdown("<p class='big-font'>Automated Cross-Reference & Compliance Dashboard</p>", unsafe_allow_html=True)
+
+# --- DIGITAL SUBMISSION PORTAL ---
+with st.container():
+    st.write("---")
+    st.markdown("### 📤 Document Submission Portal")
+    st.write("Select or drag-and-drop physical scans/digital files here. The system will automatically verify limits and route to the AI.")
+    
+    uploaded_files = st.file_uploader(
+        "Supported formats: TIFF, JPEG, PNG (Max 1.5MB) | PDF, DOC/DOCX, TXT (Max 750KB)", 
+        type=['png', 'jpg', 'jpeg', 'tif', 'tiff', 'pdf', 'doc', 'docx', 'txt'],
+        accept_multiple_files=True
+    )
+    
+    if st.button("📥 Submit Documents for Processing", use_container_width=True):
+        if uploaded_files:
+            for f in uploaded_files:
+                size_kb = f.size / 1024
+                is_image = f.name.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))
+                
+                # Strict file size validation
+                if is_image and size_kb > 1536:
+                    st.error(f"❌ Rejected: '{f.name}' ({size_kb/1024:.2f}MB) exceeds the 1.5MB image limit.")
+                    continue
+                elif not is_image and size_kb > 750:
+                    st.error(f"❌ Rejected: '{f.name}' ({size_kb:.0f}KB) exceeds the 750KB document limit.")
+                    continue
+                
+                # Route valid files to watchdog folder
+                file_path = os.path.join(WATCH_FOLDER, f.name)
+                with open(file_path, "wb") as out_file:
+                    out_file.write(f.getbuffer())
+                st.success(f"✅ Document accepted and routed to backend queue!")
+        else:
+            st.warning("Please select a file to upload first.")
+
+st.write("---")
+
+df = load_data()
+
+# --- METRIC CARDS ---
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric(label="Total Submissions", value=len(df))
+with col2:
+    st.metric(label="Currently Processing", value=len(df[df['status'] == 'Processing']))
+with col3:
+    st.metric(label="Compliant / Accepted", value=len(df[df['verdict'].isin(['COMPLIANT', 'COMPLIANT-DOC'])]))
+with col4:
+    st.metric(label="Flagged (Non-Compliant)", value=len(df[df['verdict'] == 'NON-COMPLIANT']))
+
+st.write("---")
+
+col_btn, col_empty = st.columns([1, 2])
+with col_btn:
+    if st.button("🔄 REFRESH TRACKING SYSTEM", use_container_width=True):
+        st.rerun()
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# --- COMPLIANCE TRACKING TABS ---
+tab1, tab2 = st.tabs(["📋 Complete Master Queue", "🚨 Action Required: Flagged Applications"])
+
+def render_queue(dataframe, empty_message):
+    if dataframe.empty:
+        st.info(empty_message)
+    else:
+        for index, row in dataframe.iterrows():
+            
+            # Color coding logic
+            if row['status'] == 'Processing':
+                icon = "⏳"
+                color = "#D35400" # Orange
+            elif row['verdict'] == 'COMPLIANT':
+                icon = "✅"
+                color = "#006400" # Green
+            elif row['verdict'] == 'COMPLIANT-DOC':
+                icon = "📎"
+                color = "#555555" # Grey for supporting docs
+            else:
+                icon = "❌"
+                color = "#B22222" # Red
+                
+            # ANONYMITY: Display Business Reg Number (BRN) instead of filename/company name
+            header_text = f"{icon} App #{row['id']} | Business Reg: {row.get('business_reg_number', 'UNKNOWN')} | Status: {row['status']}"
+            
+            with st.expander(header_text):
+                if row['status'] == 'Processing':
+                    st.warning("The AI is currently cross-referencing this submission. Please wait...", icon="⏳")
+                else:
+                    st.markdown(f"<p style='color:{color}; font-size:24px; font-weight:bold;'>Verdict: {row['verdict']}</p>", unsafe_allow_html=True)
+                    st.markdown("**Compliance Report:**")
+                    st.write(row['discrepancies'])
+
+with tab1:
+    render_queue(df, "The master queue is currently empty. Use the portal above to submit files.")
+
+with tab2:
+    # Filter ONLY non-compliant apps for agents to quickly address
+    flagged_df = df[df['verdict'] == 'NON-COMPLIANT']
+    render_queue(flagged_df, "Excellent! There are currently no flagged applications requiring review.")
