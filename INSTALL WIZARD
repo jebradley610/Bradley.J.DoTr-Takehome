@@ -1,0 +1,55 @@
+@echo off
+title TTB COLA Label System - Installer & Launcher
+color 0B
+
+echo ===============================================================
+echo          TTB COLA LABEL SYSTEM - AUTOMATED SETUP
+echo ===============================================================
+echo.
+echo Welcome! This wizard will configure and launch the application.
+echo.
+echo BEFORE CONTINUING, PLEASE ENSURE YOU HAVE INSTALLED:
+echo 1. Python (Make sure "Add to PATH" was checked during install)
+echo 2. Ollama (Downloaded from ollama.com and running by your clock)
+echo.
+pause
+
+echo.
+echo [1/4] Setting up the secure virtual environment...
+if not exist venv (
+    python -m venv venv
+    echo ✅ Virtual environment created.
+) else (
+    echo ✅ Virtual environment already exists.
+)
+
+echo.
+echo [2/4] Installing required background libraries...
+call venv\Scripts\activate
+pip install streamlit pandas watchdog ollama
+echo ✅ Libraries installed.
+
+echo.
+echo [3/4] Downloading the AI Vision Model (This may take a few minutes)...
+echo Note: If this fails, verify the Ollama alpaca icon is in your system tray.
+ollama pull minicpm-v
+echo ✅ AI Model downloaded and ready.
+
+echo.
+echo [4/4] Launching the TTB Application...
+echo.
+
+:: Launch the backend worker in a separate hidden/minimized window
+echo Starting Background Scanner Watchdog...
+start "TTB Backend Worker" /MIN cmd /c "call venv\Scripts\activate && python ttb_backend_worker.py"
+
+:: Launch the frontend UI in a new window
+echo Starting Agent Interface...
+start "TTB Agent Dashboard" cmd /c "call venv\Scripts\activate && streamlit run ttb_agent_interface.py"
+
+echo ===============================================================
+echo SUCCESS! The application is now running.
+echo Streamlit will automatically open the dashboard in your browser.
+echo You can close this black window.
+echo ===============================================================
+pause
