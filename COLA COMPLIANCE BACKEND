@@ -1,0 +1,197 @@
+import time
+import os
+import sqlite3
+import ollama
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# --- 1. CONFIGURATION & DIRECTORIES ---
+WATCH_FOLDER = "./Pending_Scans"
+PROCESSED_FOLDER = "./Processed_Scans"
+DB_FILE = "ttb_cola_records.db"
+
+# Ensure LAN-accessible folders exist for offline processing
+os.makedirs(WATCH_FOLDER, exist_ok=True)
+os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+
+# --- 2. DATABASE INITIALIZATION ---
+def init_db():
+    """Creates the local database for offline tracking and simulated paperwork."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Table 1: The live queue (Updated to include Business Reg Number instead of exposing company names)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS label_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            business_reg_number TEXT,
+            status TEXT,
+            verdict TEXT,
+            discrepancies TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table 2: Simulated .NET Paperwork Data 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS mock_paperwork (
+            app_id TEXT PRIMARY KEY,
+            business_reg_number TEXT,
+            brand_name TEXT,
+            class_type TEXT,
+            abv TEXT
+        )
+    ''')
+    
+    # Insert mock application data matching uploaded TTB samples
+    # Added Business Registration Numbers (BRN) to maintain anonymity on the frontend
+    mock_data = [
+        ("distilledspirits", "BRN-8849201", "OLD TOM DISTILLERY", "Kentucky Straight Bourbon Whiskey", "45% Alc./Vol. (90 Proof)"),
+        ("wine-label", "BRN-5591023", "Example Estate", "Cabernet Sauvignon", "13.5%"),
+        ("beer-maltbeverage", "BRN-1123498", "Sample Brewery", "Malt Beverage", "5.0%"),
+        ("stone", "BRN-4498122", "Stone's Throw", "IPA", "6.5%")
+    ]
+    cursor.executemany("INSERT OR IGNORE INTO mock_paperwork VALUES (?, ?, ?, ?, ?)", mock_data)
+    
+    conn.commit()
+    conn.close()
+
+# --- 3. TTB AI PROCESSING LOGIC ---
+def process_document(filepath):
+    """Parses the document via local MiniCPM-V and cross-references with paperwork."""
+    filename = os.path.basename(filepath)
+    print(f"[{time.strftime('%X')}] 📥 Received new scan: {filename}")
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Simulated Paperwork Fetch: Match filename to mock data to get the BRN early
+    cursor.execute("SELECT business_reg_number, brand_name, class_type, abv FROM mock_paperwork WHERE ? LIKE '%' || app_id || '%'", (filename.lower(),))
+    paperwork = cursor.fetchone()
+    
+    if paperwork:
+        brn, brand, class_type, abv = paperwork
+    else:
+        brn, brand, class_type, abv = ("BRN-UNKNOWN", "Unknown", "Unknown", "Unknown")
+
+    # Log as 'Processing' to update the UI instantly (Save BRN, keep brand name hidden)
+    cursor.execute("INSERT INTO label_queue (filename, business_reg_number, status) VALUES (?, ?, ?)", (filename, brn, "Processing"))
+    record_id = cursor.lastrowid
+    conn.commit()
+    
+    try:
+        # Buffer for large batch file writes on LAN
+        time.sleep(1) 
+
+        # Strict TTB Compliance Prompt
+        prompt = f"""
+        You are a Federal TTB COLA compliance auditor.
+        Review the attached beverage label image against the following Application Paperwork Data:
+        - Brand Name: {brand}
+        - Class/Type: {class_type}
+        - Alcohol Content (ABV): {abv}
+
+        CRITICAL TTB RULES:
+        1. CROSS-REFERENCE: The Brand Name, Class/Type, and ABV on the label must reasonably match the paperwork. 
+        2. GOVERNMENT WARNING (27 CFR Part 16): The label MUST contain the exact health warning statement. 
+           - The words "GOVERNMENT WARNING:" MUST be in ALL CAPS and BOLD.
+           - The text MUST be word-for-word exact.
+        3. TOLERANCE: Account for poor lighting or glare. If text is partially obscured but contextually obvious, accept it.
+        4. ANONYMITY REQUIREMENT: NEVER include the actual "Brand Name" or company name in your output. Refer to it only as "the applicant" or "the brand name" to protect PII/business data.
+
+        OUTPUT FORMAT (Strictly under 500 words):
+        - Line 1 MUST be exactly "VERDICT: COMPLIANT" or "VERDICT: NON-COMPLIANT".
+        - If NON-COMPLIANT, provide a brief, bulleted list of the exact discrepancies citing relevant TTB policies.
+        """
+        
+        # Execute Offline Vision Model (MiniCPM-V)
+        response = ollama.generate(
+            model='minicpm-v', 
+            prompt=prompt, 
+            images=[filepath]
+        )
+        
+        ai_output = response['response']
+        
+        # Determine Status cleanly
+        if "VERDICT: COMPLIANT" in ai_output.upper() and "VERDICT: NON-COMPLIANT" not in ai_output.upper():
+            verdict = "COMPLIANT"
+            status = "Processed"
+        else:
+            verdict = "NON-COMPLIANT"
+            status = "Processed"
+            
+        # Update database with results
+        cursor.execute("""
+            UPDATE label_queue 
+            SET status = ?, verdict = ?, discrepancies = ? 
+            WHERE id = ?
+        """, (status, verdict, ai_output, record_id))
+        conn.commit()
+        
+        # Move file out of the hotfolder
+        if os.path.exists(filepath):
+            os.rename(filepath, os.path.join(PROCESSED_FOLDER, filename))
+        print(f"[{time.strftime('%X')}] ✅ {status}: Reg No {brn} -> {verdict}")
+
+    except Exception as e:
+        print(f"Error processing {filename}: {e}")
+        cursor.execute("UPDATE label_queue SET status = 'Error', discrepancies = ? WHERE id = ?", (str(e), record_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+# --- 4. WATCHDOG (Batch Upload Handler) ---
+class ScanHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory:
+            return
+            
+        filename = event.src_path.lower()
+        file_size_kb = os.path.getsize(event.src_path) / 1024
+        
+        # 1. Handle Label Images (TIFF, JPEG, PNG) - Max 1.5MB (1536 KB)
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')):
+            if file_size_kb <= 1536:
+                process_document(event.src_path)
+            else:
+                print(f"[{time.strftime('%X')}] ❌ Rejected: Label exceeds 1.5MB limit.")
+                
+        # 2. Handle Supporting Attachments (PDF, DOC/DOCX, TEXT) - Max 750KB
+        elif filename.endswith(('.pdf', '.doc', '.docx', '.txt')):
+            if file_size_kb <= 750:
+                print(f"[{time.strftime('%X')}] 📎 Supporting document received and stored.")
+                
+                # Log attachment using an anonymous BRN placeholder (since OCR isn't cross-referencing it yet)
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("INSERT INTO label_queue (filename, business_reg_number, status, verdict, discrepancies) VALUES (?, ?, ?, ?, ?)", 
+                          (os.path.basename(event.src_path), "BRN-ATTACHMENT", "Processed", "COMPLIANT-DOC", "Valid supporting document securely stored. No OCR check required."))
+                conn.commit()
+                conn.close()
+                
+                time.sleep(0.5) 
+                if os.path.exists(event.src_path):
+                    os.rename(event.src_path, os.path.join(PROCESSED_FOLDER, os.path.basename(event.src_path)))
+            else:
+                print(f"[{time.strftime('%X')}] ❌ Rejected: Attachment exceeds 750KB limit.")
+
+if __name__ == "__main__":
+    init_db()
+    event_handler = ScanHandler()
+    observer = Observer()
+    observer.schedule(event_handler, WATCH_FOLDER, recursive=False)
+    observer.start()
+    
+    print("===================================================")
+    print(f"⚖️ TTB COLA Watchdog Active.")
+    print(f"📂 Monitoring '{WATCH_FOLDER}' for new LAN batch scans...")
+    print("===================================================")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
